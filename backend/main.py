@@ -136,9 +136,19 @@ def execute_pipeline(request: schemas.ExecuteRequest):
             resume_from_failed=request.resume_from_failed,
             execution_id=request.execution_id
         )
-        return result
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+    if result.get("status") == "rejected":
+        reason = result.get("reason")
+        status_map = {
+            "pipeline_not_found": 404,
+            "execution_not_found": 404,
+            "already_running": 409,
+            "already_completed": 409,
+        }
+        raise HTTPException(status_code=status_map.get(reason, 400), detail=result)
+    return result
 
 
 @app.post("/scheduler")
