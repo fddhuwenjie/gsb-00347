@@ -92,6 +92,7 @@ class ExecuteRequest(BaseModel):
     pipeline_id: int
     resume_from_failed: bool = False
     execution_id: Optional[int] = None
+    synchronous: bool = False
 
 
 class NodeConfig(BaseModel):
