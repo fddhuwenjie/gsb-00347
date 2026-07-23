@@ -10,6 +10,7 @@ from output_targets import OutputExecutor
 from data_quality import QualityRuleEngine
 from lineage_tracker import LineageTracker
 import models
+import json
 
 
 class NodeStatus:
@@ -17,6 +18,9 @@ class NodeStatus:
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+
+
+CHECKPOINT_VERSION = 1
 
 
 class DAGExecutor:
@@ -34,18 +38,24 @@ class DAGExecutor:
         self.execution_order: List[str] = []
         self.performance_metrics: Dict[str, Dict[str, Any]] = {}
         self.quality_reports: List[Dict[str, Any]] = []
+        self.completed_node_ids: set = set()
+        self.output_written_nodes: set = set()
         self.lineage_tracker = LineageTracker(pipeline_id, execution_id) if pipeline_id else None
         self.quality_engine = QualityRuleEngine()
+        self._adjacency = self._build_adjacency()
+        self._skip_side_effects = False
+
+    def _build_adjacency(self) -> Dict[str, List[str]]:
+        adj = {node["id"]: [] for node in self.nodes}
+        for edge in self.edges:
+            adj[edge["source"]].append(edge["target"])
+        return adj
 
     def topological_sort(self) -> List[str]:
         in_degree = {node["id"]: 0 for node in self.nodes}
-        adjacency = {node["id"]: [] for node in self.nodes}
 
         for edge in self.edges:
-            source = edge["source"]
-            target = edge["target"]
-            adjacency[source].append(target)
-            in_degree[target] += 1
+            in_degree[edge["target"]] += 1
 
         queue = deque([node_id for node_id, degree in in_degree.items() if degree == 0])
         result = []
@@ -54,7 +64,7 @@ class DAGExecutor:
             node_id = queue.popleft()
             result.append(node_id)
 
-            for neighbor in adjacency[node_id]:
+            for neighbor in self._adjacency[node_id]:
                 in_degree[neighbor] -= 1
                 if in_degree[neighbor] == 0:
                     queue.append(neighbor)
@@ -63,6 +73,21 @@ class DAGExecutor:
             raise ValueError("DAG has a cycle")
 
         return result
+
+    def get_downstream_nodes(self, node_id: str) -> List[str]:
+        downstream = []
+        visited = set()
+        queue = deque([node_id])
+
+        while queue:
+            current = queue.popleft()
+            for neighbor in self._adjacency.get(current, []):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    downstream.append(neighbor)
+                    queue.append(neighbor)
+
+        return downstream
 
     def get_node_inputs(self, node_id: str) -> List[pd.DataFrame]:
         inputs = []
@@ -93,7 +118,7 @@ class DAGExecutor:
         duration_ms = (end_time - start_time).total_seconds() * 1000
         throughput = self._calculate_throughput(output_rows, start_time, end_time)
 
-        self.performance_metrics[node_id] = {
+        metric_data = {
             "node_id": node_id,
             "start_time": start_time.isoformat(),
             "end_time": end_time.isoformat(),
@@ -103,20 +128,46 @@ class DAGExecutor:
             "throughput": round(throughput, 2),
             "memory_peak_bytes": memory_peak
         }
+        self.performance_metrics[node_id] = metric_data
 
         if self.execution_id and self.db_session:
-            metric = models.PerformanceMetric(
+            existing = self.db_session.query(models.PerformanceMetric).filter_by(
                 execution_id=self.execution_id,
-                node_id=node_id,
-                start_time=start_time,
-                end_time=end_time,
-                duration_ms=duration_ms,
-                input_rows=input_rows,
-                output_rows=output_rows,
-                throughput=round(throughput, 2),
-                memory_peak_bytes=memory_peak
-            )
-            self.db_session.add(metric)
+                node_id=node_id
+            ).first()
+            if existing:
+                existing.start_time = start_time
+                existing.end_time = end_time
+                existing.duration_ms = duration_ms
+                existing.input_rows = input_rows
+                existing.output_rows = output_rows
+                existing.throughput = round(throughput, 2)
+                existing.memory_peak_bytes = memory_peak
+            else:
+                metric = models.PerformanceMetric(
+                    execution_id=self.execution_id,
+                    node_id=node_id,
+                    start_time=start_time,
+                    end_time=end_time,
+                    duration_ms=duration_ms,
+                    input_rows=input_rows,
+                    output_rows=output_rows,
+                    throughput=round(throughput, 2),
+                    memory_peak_bytes=memory_peak
+                )
+                self.db_session.add(metric)
+
+    def _delete_quality_reports_for_node(self, node_id: str):
+        if self.execution_id and self.db_session:
+            self.db_session.query(models.QualityReport).filter_by(
+                execution_id=self.execution_id,
+                node_id=node_id
+            ).delete()
+            self.db_session.query(models.QuarantineRecord).filter_by(
+                execution_id=self.execution_id,
+                node_id=node_id
+            ).delete()
+        self.quality_reports = [r for r in self.quality_reports if r.get("node_id") != node_id]
 
     def _run_quality_checks(self, node_id: str, df: pd.DataFrame) -> Tuple[pd.DataFrame, bool]:
         if not self.pipeline_id or not self.db_session:
@@ -161,7 +212,7 @@ class DAGExecutor:
 
     def _track_lineage(self, node_id: str, node_type: str, config: Dict[str, Any],
                        inputs: List[pd.DataFrame], output: Any):
-        if not self.lineage_tracker:
+        if not self.lineage_tracker or self._skip_side_effects:
             return
 
         node = self.node_map.get(node_id, {})
@@ -223,6 +274,9 @@ class DAGExecutor:
         node_data = node.get("data", {})
         config = node_data.get("config", {})
 
+        if node_id in self.completed_node_ids:
+            return True, None
+
         start_time = datetime.now()
         self.node_states[node_id] = {
             "status": NodeStatus.RUNNING,
@@ -231,6 +285,7 @@ class DAGExecutor:
             "output_rows": 0,
             "error": None
         }
+        self._save_checkpoint()
 
         memory_peak = 0
 
@@ -285,9 +340,20 @@ class DAGExecutor:
                     if not should_continue:
                         raise RuntimeError(f"Data quality check failed for node {node_id}")
 
-                    output_type = config.get("output_type")
-                    output_config = config.get("output_config", {})
-                    rows_written, errors = OutputExecutor.write(output_type, df, output_config)
+                    if node_id not in self.output_written_nodes:
+                        output_type = config.get("output_type")
+                        output_config = config.get("output_config", {})
+                        rows_written, errors = OutputExecutor.write(
+                            output_type, df, output_config,
+                            execution_id=self.execution_id,
+                            node_id=node_id
+                        )
+                        self.output_written_nodes.add(node_id)
+                        self._save_checkpoint()
+                    else:
+                        rows_written = len(df)
+                        errors = []
+
                     self.node_states[node_id]["output_rows"] = rows_written
                     if errors:
                         self.node_states[node_id]["warnings"] = errors
@@ -300,6 +366,8 @@ class DAGExecutor:
             end_time = datetime.now()
             self.node_states[node_id]["status"] = NodeStatus.COMPLETED
             self.node_states[node_id]["end_time"] = end_time.isoformat()
+            self.node_states[node_id]["error"] = None
+            self.completed_node_ids.add(node_id)
 
             self._track_performance(
                 node_id, start_time, end_time,
@@ -307,6 +375,8 @@ class DAGExecutor:
                 self.node_states[node_id]["output_rows"],
                 memory_peak
             )
+
+            self._save_checkpoint()
 
             return True, None
 
@@ -323,26 +393,270 @@ class DAGExecutor:
                 memory_peak
             )
 
+            self._save_checkpoint()
+
             return False, str(e)
 
-    def execute(self, resume_from: Optional[str] = None,
-                checkpoint_states: Optional[Dict[str, Any]] = None) -> Tuple[bool, Dict[str, Any]]:
-        if checkpoint_states:
-            self.node_states = checkpoint_states
-            for node_id, state in checkpoint_states.items():
-                if state.get("status") == NodeStatus.COMPLETED:
+    def _serialize_dataframe(self, df: pd.DataFrame) -> Dict[str, Any]:
+        dtype_map = {}
+        for col in df.columns:
+            dtype_map[col] = str(df[col].dtype)
+
+        records = df.to_dict("records")
+
+        for record in records:
+            for col, val in record.items():
+                if isinstance(val, (pd.Timestamp, datetime)):
+                    record[col] = val.isoformat()
+                elif isinstance(val, (np.integer,)):
+                    record[col] = int(val)
+                elif isinstance(val, (np.floating,)):
+                    record[col] = float(val)
+                elif isinstance(val, (np.bool_,)):
+                    record[col] = bool(val)
+                elif pd.isna(val):
+                    record[col] = None
+
+        return {
+            "type": "dataframe",
+            "columns": list(df.columns),
+            "dtypes": dtype_map,
+            "data": records
+        }
+
+    def _deserialize_dataframe(self, serialized: Dict[str, Any]) -> pd.DataFrame:
+        columns = serialized["columns"]
+        dtype_map = serialized.get("dtypes", {})
+        records = serialized["data"]
+
+        df = pd.DataFrame(records, columns=columns)
+
+        for col in columns:
+            if col in dtype_map:
+                dtype_str = dtype_map[col]
+                try:
+                    if "datetime" in dtype_str:
+                        df[col] = pd.to_datetime(df[col], errors="coerce")
+                    elif dtype_str in ("int64", "Int64", "int32"):
+                        df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
+                    elif dtype_str in ("float64", "float32"):
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
+                    elif dtype_str in ("bool", "boolean"):
+                        df[col] = df[col].astype("boolean")
+                    elif dtype_str in ("object", "str", "string"):
+                        df[col] = df[col].astype("object")
+                except (ValueError, TypeError):
                     pass
 
-        self.execution_order = self.topological_sort()
-        start_index = 0
+        return df
 
-        if resume_from:
-            if resume_from in self.execution_order:
-                start_index = self.execution_order.index(resume_from)
+    def _serialize_output(self, output: Any) -> Any:
+        if isinstance(output, pd.DataFrame):
+            return self._serialize_dataframe(output)
+        elif isinstance(output, list):
+            return {
+                "type": "list",
+                "data": [self._serialize_output(item) for item in output]
+            }
+        return output
 
-        for node_id in self.execution_order[start_index:]:
-            if self.node_states.get(node_id, {}).get("status") == NodeStatus.COMPLETED:
+    def _deserialize_output(self, serialized: Any) -> Any:
+        if isinstance(serialized, dict):
+            if serialized.get("type") == "dataframe":
+                return self._deserialize_dataframe(serialized)
+            elif serialized.get("type") == "list":
+                return [self._deserialize_output(item) for item in serialized["data"]]
+        return serialized
+
+    def _create_checkpoint(self) -> Dict[str, Any]:
+        serialized_outputs = {}
+        for node_id in self.completed_node_ids:
+            output = self.node_outputs.get(node_id)
+            if output is not None:
+                serialized_outputs[node_id] = self._serialize_output(output)
+
+        return {
+            "version": CHECKPOINT_VERSION,
+            "node_states": {k: v for k, v in self.node_states.items()},
+            "node_outputs": serialized_outputs,
+            "completed_node_ids": list(self.completed_node_ids),
+            "output_written_nodes": list(self.output_written_nodes),
+            "performance_metrics": self.performance_metrics,
+            "quality_reports": self.quality_reports
+        }
+
+    def _save_checkpoint(self):
+        if self.execution_id and self.db_session:
+            checkpoint = self._create_checkpoint()
+            execution = self.db_session.query(models.Execution).filter_by(
+                id=self.execution_id
+            ).first()
+            if execution:
+                execution.checkpoint_data = checkpoint
+                execution.node_states = self.node_states
+                self.db_session.commit()
+
+    def restore_from_checkpoint(self, checkpoint_data: Dict[str, Any]):
+        if not checkpoint_data:
+            return
+
+        version = checkpoint_data.get("version", 0)
+        if version != CHECKPOINT_VERSION:
+            pass
+
+        self.node_states = checkpoint_data.get("node_states", {})
+
+        self.completed_node_ids = set(checkpoint_data.get("completed_node_ids", []))
+        self.output_written_nodes = set(checkpoint_data.get("output_written_nodes", []))
+
+        serialized_outputs = checkpoint_data.get("node_outputs", {})
+        self.node_outputs = {}
+        for node_id, serialized in serialized_outputs.items():
+            self.node_outputs[node_id] = self._deserialize_output(serialized)
+
+        self.performance_metrics = checkpoint_data.get("performance_metrics", {})
+        self.quality_reports = checkpoint_data.get("quality_reports", [])
+
+    @staticmethod
+    def compute_nodes_to_rerun(dag_config: Dict[str, Any], checkpoint_data: Dict[str, Any]) -> set:
+        nodes = dag_config.get("nodes", [])
+        edges = dag_config.get("edges", [])
+        adjacency = {node["id"]: [] for node in nodes}
+        for edge in edges:
+            adjacency.setdefault(edge["source"], []).append(edge["target"])
+
+        node_states = checkpoint_data.get("node_states", {})
+        to_rerun = set()
+        for node_id, state in node_states.items():
+            status = state.get("status")
+            if status in (NodeStatus.FAILED, NodeStatus.PENDING, NodeStatus.RUNNING):
+                to_rerun.add(node_id)
+                visited = set()
+                queue = deque([node_id])
+                while queue:
+                    current = queue.popleft()
+                    for neighbor in adjacency.get(current, []):
+                        if neighbor not in visited:
+                            visited.add(neighbor)
+                            to_rerun.add(neighbor)
+                            queue.append(neighbor)
+
+        if not to_rerun:
+            in_degree = {node["id"]: 0 for node in nodes}
+            for edge in edges:
+                in_degree[edge["target"]] += 1
+            queue = deque([nid for nid, d in in_degree.items() if d == 0])
+            ordered = []
+            while queue:
+                nid = queue.popleft()
+                ordered.append(nid)
+                for neighbor in adjacency.get(nid, []):
+                    in_degree[neighbor] -= 1
+                    if in_degree[neighbor] == 0:
+                        queue.append(neighbor)
+            last_completed_idx = -1
+            for i, nid in enumerate(ordered):
+                if node_states.get(nid, {}).get("status") == NodeStatus.COMPLETED:
+                    last_completed_idx = i
+                else:
+                    break
+            to_rerun = set(ordered[last_completed_idx + 1:])
+
+        return to_rerun
+
+    def _get_nodes_to_rerun(self) -> set:
+        to_rerun = set()
+        for node_id, state in self.node_states.items():
+            status = state.get("status")
+            if status in (NodeStatus.FAILED, NodeStatus.PENDING, NodeStatus.RUNNING):
+                to_rerun.add(node_id)
+                downstream = self.get_downstream_nodes(node_id)
+                to_rerun.update(downstream)
+
+        if not to_rerun:
+            ordered_nodes = self.topological_sort()
+            last_completed_idx = -1
+            for i, nid in enumerate(ordered_nodes):
+                if self.node_states.get(nid, {}).get("status") == NodeStatus.COMPLETED:
+                    last_completed_idx = i
+                else:
+                    break
+            to_rerun = set(ordered_nodes[last_completed_idx + 1:])
+
+        return to_rerun
+
+    def _clear_stale_data_for_rerun(self, nodes_to_rerun: set):
+        if self.execution_id and self.db_session:
+            self.db_session.query(models.LineageRecord).filter_by(
+                execution_id=self.execution_id
+            ).delete(synchronize_session=False)
+
+        for node_id in nodes_to_rerun:
+            if node_id in self.completed_node_ids:
+                self.completed_node_ids.discard(node_id)
+
+            self.node_states[node_id] = {
+                "status": NodeStatus.PENDING,
+                "start_time": None,
+                "end_time": None,
+                "input_rows": 0,
+                "output_rows": 0,
+                "error": None
+            }
+
+            if node_id in self.node_outputs:
+                del self.node_outputs[node_id]
+
+            if self.execution_id and self.db_session:
+                self.db_session.query(models.PerformanceMetric).filter_by(
+                    execution_id=self.execution_id,
+                    node_id=node_id
+                ).delete(synchronize_session=False)
+
+            self.performance_metrics.pop(node_id, None)
+            self._delete_quality_reports_for_node(node_id)
+
+    def _rebuild_lineage_for_completed_nodes(self):
+        if not self.lineage_tracker:
+            return
+        for node_id in self.execution_order:
+            if node_id not in self.completed_node_ids:
                 continue
+            node = self.node_map.get(node_id, {})
+            node_type = node.get("type")
+            config = node.get("data", {}).get("config", {})
+            if node_type == "source":
+                output = self.node_outputs.get(node_id)
+                self._track_lineage(node_id, node_type, config, [], output)
+            elif node_type == "output":
+                inputs = self.get_node_inputs(node_id)
+                self._track_lineage(node_id, node_type, config, inputs, inputs[0] if inputs else None)
+            else:
+                inputs = self.get_node_inputs(node_id)
+                output = self.node_outputs.get(node_id)
+                self._track_lineage(node_id, node_type, config, inputs, output)
+
+    def execute(self, resume_from_checkpoint: Optional[Dict[str, Any]] = None) -> Tuple[bool, Dict[str, Any]]:
+        self.execution_order = self.topological_sort()
+
+        if resume_from_checkpoint:
+            self.restore_from_checkpoint(resume_from_checkpoint)
+            nodes_to_rerun = self._get_nodes_to_rerun()
+            self._clear_stale_data_for_rerun(nodes_to_rerun)
+            self._rebuild_lineage_for_completed_nodes()
+            self._skip_side_effects = False
+        else:
+            nodes_to_rerun = set(self.execution_order)
+            self._skip_side_effects = False
+
+        for node_id in self.execution_order:
+            if node_id in self.completed_node_ids:
+                continue
+
+            if resume_from_checkpoint and node_id not in nodes_to_rerun:
+                state = self.node_states.get(node_id, {})
+                if state.get("status") == NodeStatus.COMPLETED:
+                    continue
 
             success, error = self.execute_node(node_id)
             if not success:
@@ -370,24 +684,6 @@ class DAGExecutor:
             "performance_metrics": self.performance_metrics,
             "quality_reports": self.quality_reports
         }
-
-    def _create_checkpoint(self) -> Dict[str, Any]:
-        return {
-            "node_states": self.node_states,
-            "node_outputs": {
-                node_id: self._serialize_output(output)
-                for node_id, output in self.node_outputs.items()
-            },
-            "performance_metrics": self.performance_metrics,
-            "quality_reports": self.quality_reports
-        }
-
-    def _serialize_output(self, output: Any) -> Any:
-        if isinstance(output, pd.DataFrame):
-            return output.to_dict("records")
-        elif isinstance(output, list):
-            return [self._serialize_output(item) for item in output]
-        return output
 
     def get_total_rows(self) -> int:
         return sum(
