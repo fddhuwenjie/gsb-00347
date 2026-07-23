@@ -1,3 +1,4 @@
+import json
 import pandas as pd
 import numpy as np
 from typing import Dict, Any, List, Tuple, Optional
@@ -21,11 +22,13 @@ class NodeStatus:
 
 class DAGExecutor:
     def __init__(self, dag_config: Dict[str, Any], pipeline_id: int = None,
-                 execution_id: int = None, db_session: Session = None):
+                 execution_id: int = None, db_session: Session = None,
+                 checkpoint_callback=None):
         self.dag_config = dag_config
         self.pipeline_id = pipeline_id
         self.execution_id = execution_id
         self.db_session = db_session
+        self.checkpoint_callback = checkpoint_callback
         self.nodes = dag_config.get("nodes", [])
         self.edges = dag_config.get("edges", [])
         self.node_map = {node["id"]: node for node in self.nodes}
@@ -34,6 +37,10 @@ class DAGExecutor:
         self.execution_order: List[str] = []
         self.performance_metrics: Dict[str, Dict[str, Any]] = {}
         self.quality_reports: List[Dict[str, Any]] = []
+        # Node ids whose outputs/state were restored from a checkpoint and that
+        # must NOT be re-executed on resume. Their side effects (writes, metrics,
+        # quality reports, lineage) were already produced in the earlier run.
+        self.restored_nodes: set = set()
         self.lineage_tracker = LineageTracker(pipeline_id, execution_id) if pipeline_id else None
         self.quality_engine = QualityRuleEngine()
 
@@ -287,7 +294,18 @@ class DAGExecutor:
 
                     output_type = config.get("output_type")
                     output_config = config.get("output_config", {})
-                    rows_written, errors = OutputExecutor.write(output_type, df, output_config)
+                    # Stable per (execution, node) key: on resume the output
+                    # target skips the physical write if it already committed,
+                    # so an interrupt between "write committed" and "checkpoint
+                    # saved" never causes a duplicate write.
+                    idempotency_key = (
+                        f"exec:{self.execution_id}:node:{node_id}"
+                        if self.execution_id is not None else None
+                    )
+                    rows_written, errors = OutputExecutor.write(
+                        output_type, df, output_config,
+                        idempotency_key=idempotency_key
+                    )
                     self.node_states[node_id]["output_rows"] = rows_written
                     if errors:
                         self.node_states[node_id]["warnings"] = errors
@@ -326,28 +344,58 @@ class DAGExecutor:
             return False, str(e)
 
     def execute(self, resume_from: Optional[str] = None,
-                checkpoint_states: Optional[Dict[str, Any]] = None) -> Tuple[bool, Dict[str, Any]]:
-        if checkpoint_states:
-            self.node_states = checkpoint_states
-            for node_id, state in checkpoint_states.items():
-                if state.get("status") == NodeStatus.COMPLETED:
-                    pass
-
+                checkpoint_states: Optional[Dict[str, Any]] = None,
+                checkpoint_data: Optional[Dict[str, Any]] = None) -> Tuple[bool, Dict[str, Any]]:
         self.execution_order = self.topological_sort()
-        start_index = 0
 
-        if resume_from:
-            if resume_from in self.execution_order:
-                start_index = self.execution_order.index(resume_from)
+        rerun_nodes: set = set()
+        if checkpoint_data:
+            # Full checkpoint: restore node states, materialized upstream outputs
+            # (with column types), performance metrics and quality reports so that
+            # downstream nodes see exactly the same data as the original run.
+            self._restore_from_checkpoint(checkpoint_data)
+        elif checkpoint_states:
+            # Backwards-compatible path: only node states were persisted.
+            self.node_states = dict(checkpoint_states)
 
-        for node_id in self.execution_order[start_index:]:
-            if self.node_states.get(node_id, {}).get("status") == NodeStatus.COMPLETED:
+        if checkpoint_data or checkpoint_states:
+            # A node must be re-run if it is not in a COMPLETED state, or if it is
+            # a downstream dependency of such a node. Everything else is a
+            # "retained" node whose output and side effects are reused as-is.
+            incomplete_nodes = {
+                node_id for node_id in self.execution_order
+                if self.node_states.get(node_id, {}).get("status") != NodeStatus.COMPLETED
+            }
+            rerun_nodes = set(incomplete_nodes) | self._get_descendants(incomplete_nodes)
+
+            self.restored_nodes = {
+                node_id for node_id in self.execution_order
+                if node_id not in rerun_nodes
+                and self.node_states.get(node_id, {}).get("status") == NodeStatus.COMPLETED
+            }
+
+            # Remove stale side effects (metrics / quality reports / quarantine)
+            # produced by the previous attempt for the nodes we are about to
+            # re-run, so a resume never leaves duplicate rows behind.
+            self._cleanup_rerun_side_effects(rerun_nodes)
+
+            # Discard restored outputs for nodes we will recompute.
+            for node_id in rerun_nodes:
+                self.node_outputs.pop(node_id, None)
+                self.performance_metrics.pop(node_id, None)
+
+        for node_id in self.execution_order:
+            # Retained nodes keep their restored output/state and are never
+            # re-executed: no duplicate writes, metrics, reports or lineage.
+            if node_id in self.restored_nodes:
+                continue
+            if not (checkpoint_data or checkpoint_states) and \
+                    self.node_states.get(node_id, {}).get("status") == NodeStatus.COMPLETED:
                 continue
 
             success, error = self.execute_node(node_id)
             if not success:
-                if self.lineage_tracker and self.db_session:
-                    self.lineage_tracker.save_to_db(self.db_session)
+                self._persist_lineage()
                 if self.db_session:
                     self.db_session.commit()
                 return False, {
@@ -359,8 +407,11 @@ class DAGExecutor:
                     "quality_reports": self.quality_reports
                 }
 
-        if self.lineage_tracker and self.db_session:
-            self.lineage_tracker.save_to_db(self.db_session)
+            # Every node that succeeds durably advances the checkpoint, so a
+            # crash in a later node never loses the last complete checkpoint.
+            self._persist_checkpoint()
+
+        self._persist_lineage()
         if self.db_session:
             self.db_session.commit()
 
@@ -370,6 +421,61 @@ class DAGExecutor:
             "performance_metrics": self.performance_metrics,
             "quality_reports": self.quality_reports
         }
+
+    def _get_descendants(self, node_ids: set) -> set:
+        adjacency = {node["id"]: [] for node in self.nodes}
+        for edge in self.edges:
+            adjacency[edge["source"]].append(edge["target"])
+
+        descendants: set = set()
+        queue = deque(node_ids)
+        while queue:
+            current = queue.popleft()
+            for neighbor in adjacency.get(current, []):
+                if neighbor not in descendants:
+                    descendants.add(neighbor)
+                    queue.append(neighbor)
+        return descendants
+
+    def _restore_from_checkpoint(self, checkpoint_data: Dict[str, Any]):
+        self.node_states = dict(checkpoint_data.get("node_states") or {})
+        self.performance_metrics = dict(checkpoint_data.get("performance_metrics") or {})
+        self.quality_reports = list(checkpoint_data.get("quality_reports") or [])
+        self.node_outputs = {
+            node_id: self._deserialize_output(serialized)
+            for node_id, serialized in (checkpoint_data.get("node_outputs") or {}).items()
+        }
+
+    def _cleanup_rerun_side_effects(self, rerun_nodes: set):
+        if not (self.execution_id and self.db_session) or not rerun_nodes:
+            return
+        node_ids = list(rerun_nodes)
+        self.db_session.query(models.PerformanceMetric).filter(
+            models.PerformanceMetric.execution_id == self.execution_id,
+            models.PerformanceMetric.node_id.in_(node_ids)
+        ).delete(synchronize_session=False)
+        self.db_session.query(models.QualityReport).filter(
+            models.QualityReport.execution_id == self.execution_id,
+            models.QualityReport.node_id.in_(node_ids)
+        ).delete(synchronize_session=False)
+        self.db_session.query(models.QuarantineRecord).filter(
+            models.QuarantineRecord.execution_id == self.execution_id,
+            models.QuarantineRecord.node_id.in_(node_ids)
+        ).delete(synchronize_session=False)
+        self.db_session.commit()
+
+    def _persist_lineage(self):
+        if self.lineage_tracker and self.db_session:
+            self.lineage_tracker.save_to_db(self.db_session)
+            # Clear the buffer so repeated flushes never duplicate lineage rows.
+            self.lineage_tracker._lineage_records = []
+
+    def _persist_checkpoint(self):
+        self._persist_lineage()
+        if self.db_session:
+            self.db_session.commit()
+        if self.checkpoint_callback:
+            self.checkpoint_callback(self._create_checkpoint(), self.node_states)
 
     def _create_checkpoint(self) -> Dict[str, Any]:
         return {
@@ -383,11 +489,47 @@ class DAGExecutor:
         }
 
     def _serialize_output(self, output: Any) -> Any:
+        # DataFrames are stored with their column order and dtypes so that a
+        # resumed run rebuilds an identical frame (types included), and branch /
+        # multi-output nodes keep their list structure.
         if isinstance(output, pd.DataFrame):
-            return output.to_dict("records")
+            return {
+                "__kind__": "dataframe",
+                "columns": [str(col) for col in output.columns],
+                "dtypes": {str(col): str(output[col].dtype) for col in output.columns},
+                "records": json.loads(output.to_json(orient="records", date_format="iso"))
+            }
         elif isinstance(output, list):
-            return [self._serialize_output(item) for item in output]
-        return output
+            return {
+                "__kind__": "list",
+                "items": [self._serialize_output(item) for item in output]
+            }
+        return {"__kind__": "raw", "value": output}
+
+    def _deserialize_output(self, data: Any) -> Any:
+        if isinstance(data, dict) and "__kind__" in data:
+            kind = data["__kind__"]
+            if kind == "dataframe":
+                columns = data.get("columns") or None
+                df = pd.DataFrame(data.get("records", []), columns=columns)
+                for col, dtype in (data.get("dtypes") or {}).items():
+                    if col not in df.columns:
+                        continue
+                    try:
+                        if dtype.startswith("datetime"):
+                            df[col] = pd.to_datetime(df[col])
+                        else:
+                            df[col] = df[col].astype(dtype)
+                    except (ValueError, TypeError):
+                        pass
+                return df
+            elif kind == "list":
+                return [self._deserialize_output(item) for item in data.get("items", [])]
+            return data.get("value")
+        # Legacy checkpoint format: a plain list of record dicts.
+        if isinstance(data, list):
+            return pd.DataFrame(data)
+        return data
 
     def get_total_rows(self) -> int:
         return sum(
