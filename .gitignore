@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+.venv-check/
+venv/
+node_modules/
+build/
+dist/
+coverage/
+uploads/
+*.db
+!data/sample_data/sales.db
+.env
+.env.*
+!.env.example
+.DS_Store
+*.log

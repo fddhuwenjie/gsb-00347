@@ -1,0 +1,134 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  width: 100%;
+  height: 100%;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.react-flow__node {
+  border-radius: 8px;
+  border: 2px solid #d9d9d9;
+  background: white;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  padding: 8px 12px;
+  font-size: 12px;
+}
+
+.react-flow__node.selected {
+  border-color: #1890ff;
+  box-shadow: 0 0 0 2px rgba(24, 144, 255, 0.2);
+}
+
+.react-flow__node-source {
+  border-color: #52c41a;
+  background: #f6ffed;
+}
+
+.react-flow__node-output {
+  border-color: #faad14;
+  background: #fffbe6;
+}
+
+.react-flow__node-filter {
+  border-color: #1890ff;
+  background: #e6f7ff;
+}
+
+.react-flow__node-map {
+  border-color: #722ed1;
+  background: #f9f0ff;
+}
+
+.react-flow__node-aggregate {
+  border-color: #eb2f96;
+  background: #fff0f6;
+}
+
+.react-flow__node-sort {
+  border-color: #fa8c16;
+  background: #fff7e6;
+}
+
+.react-flow__node-deduplicate {
+  border-color: #13c2c2;
+  background: #e6fffb;
+}
+
+.react-flow__node-join {
+  border-color: #fa541c;
+  background: #fff2e8;
+}
+
+.react-flow__node-branch {
+  border-color: #a0d911;
+  background: #fcffe6;
+}
+
+.react-flow__handle {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid white;
+  background: #1890ff;
+}
+
+.react-flow__handle-left {
+  left: -5px;
+}
+
+.react-flow__handle-right {
+  right: -5px;
+}
+
+.node-label {
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 150px;
+}
+
+.node-type {
+  font-size: 10px;
+  color: #666;
+  margin-top: 2px;
+}
+
+.node-status {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 4px;
+}
+
+.status-pending {
+  background: #d9d9d9;
+}
+
+.status-running {
+  background: #1890ff;
+  animation: pulse 1s infinite;
+}
+
+.status-completed {
+  background: #52c41a;
+}
+
+.status-failed {
+  background: #ff4d4f;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}

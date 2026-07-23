@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8347:8347"
+    volumes:
+      - ./backend:/app
+      - ./data:/data
+    environment:
+      - DATABASE_URL=sqlite:////data/etl_system.db
+      - UPLOAD_DIR=/data/uploads
+      - EXPORT_DIR=/data/exports
+    networks:
+      - etl-network
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3347:3347"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      - REACT_APP_API_URL=http://localhost:8347
+    depends_on:
+      - backend
+    networks:
+      - etl-network
+
+networks:
+  etl-network:
+    driver: bridge

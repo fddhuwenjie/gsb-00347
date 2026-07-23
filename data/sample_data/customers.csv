@@ -1,0 +1,16 @@
+id,name,email,age,city,phone,registration_date
+1,张三,zhangsan@example.com,28,北京,13800138001,2023-01-15
+2,李四,lisi@example.com,35,上海,13800138002,2023-02-20
+3,王五,wangwu@example.com,22,广州,13800138003,2023-03-10
+4,赵六,zhaoliu@example.com,41,深圳,13800138004,2023-04-05
+5,钱七,qianqi@example.com,29,杭州,13800138005,2023-05-12
+6,孙八,sunba@example.com,33,南京,13800138006,2023-06-18
+7,周九,zhoujiu@example.com,27,成都,13800138007,2023-07-22
+8,吴十,wushi@example.com,38,武汉,13800138008,2023-08-30
+9,郑十一,zheng11@example.com,25,西安,13800138009,2023-09-14
+10,王十二,wang12@example.com,31,重庆,13800138010,2023-10-08
+11,刘十三,liu13@example.com,26,天津,13800138011,2023-11-25
+12,陈十四,chen14@example.com,39,苏州,13800138012,2023-12-03
+13,杨十五,yang15@example.com,24,青岛,13800138013,2024-01-09
+14,黄十六,huang16@example.com,37,大连,13800138014,2024-02-14
+15,赵十七,zhao17@example.com,30,厦门,13800138015,2024-03-21
