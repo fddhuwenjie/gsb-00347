@@ -134,9 +134,19 @@ def execute_pipeline(request: schemas.ExecuteRequest):
         result = scheduler.execute_pipeline(
             request.pipeline_id,
             resume_from_failed=request.resume_from_failed,
-            execution_id=request.execution_id
+            execution_id=request.execution_id,
+            synchronous=request.synchronous
         )
+        if result.get("status") in ("not_found",):
+            raise HTTPException(status_code=404, detail=result.get("message"))
+        if result.get("status") in ("already_running", "concurrent_resume"):
+            raise HTTPException(status_code=409, detail=result.get("message"))
+        if result.get("status") in ("already_completed", "not_started", "not_resumable",
+                                     "pipeline_mismatch", "no_checkpoint", "missing_execution_id"):
+            raise HTTPException(status_code=400, detail=result.get("message"))
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

@@ -1,4 +1,4 @@
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set
 from models import LineageRecord
 from schemas import LineageGraph, LineageNode, LineageLink
 from datetime import datetime
@@ -22,9 +22,11 @@ class LineageTracker:
         self._field_mappings: List[Dict[str, Any]] = []
         self._transform_records: List[Dict[str, Any]] = []
         self._lineage_records: List[LineageRecord] = []
+        self._node_record_index: Dict[str, List[int]] = {}
 
     def track_field_mapping(
         self,
+        node_id: str,
         source_table: str,
         source_column: str,
         target_table: str,
@@ -34,16 +36,20 @@ class LineageTracker:
         validated_ops = []
         for op in transform_ops:
             op_type = op.get("type")
-            if op_type not in SUPPORTED_TRANSFORMS:
+            if op_type is not None and op_type not in SUPPORTED_TRANSFORMS:
                 continue
-            required_fields = SUPPORTED_TRANSFORMS[op_type]
-            validated_op = {"type": op_type}
-            for field in required_fields:
-                if field in op:
-                    validated_op[field] = op[field]
-            validated_ops.append(validated_op)
+            if op_type is None:
+                validated_ops.append({k: v for k, v in op.items() if k != "node_id"})
+            else:
+                required_fields = SUPPORTED_TRANSFORMS[op_type]
+                validated_op = {"type": op_type}
+                for field in required_fields:
+                    if field in op:
+                        validated_op[field] = op[field]
+                validated_ops.append(validated_op)
 
         mapping = {
+            "node_id": node_id,
             "source_table": source_table,
             "source_column": source_column,
             "target_table": target_table,
@@ -63,6 +69,9 @@ class LineageTracker:
             created_at=datetime.utcnow()
         )
         self._lineage_records.append(lineage_record)
+
+        idx = len(self._lineage_records) - 1
+        self._node_record_index.setdefault(node_id, []).append(idx)
 
     def record_transform(
         self,
@@ -90,8 +99,99 @@ class LineageTracker:
             records = [r for r in records if r.execution_id == self.execution_id]
         return LineageGraphBuilder.build_sankey_data(records)
 
+    def remove_nodes(self, node_ids: Set[str]):
+        if not node_ids:
+            return
+
+        remove_indices: Set[int] = set()
+        for node_id in node_ids:
+            indices = self._node_record_index.get(node_id, [])
+            remove_indices.update(indices)
+            if node_id in self._node_record_index:
+                del self._node_record_index[node_id]
+
+        if remove_indices:
+            self._lineage_records = [
+                rec for i, rec in enumerate(self._lineage_records)
+                if i not in remove_indices
+            ]
+            self._field_mappings = [
+                m for m in self._field_mappings
+                if m.get("node_id") not in node_ids
+            ]
+
+        self._node_record_index = {}
+        for i, rec in enumerate(self._lineage_records):
+            mapping = self._field_mappings[i] if i < len(self._field_mappings) else None
+            if mapping:
+                nid = mapping.get("node_id")
+                if nid:
+                    self._node_record_index.setdefault(nid, []).append(i)
+
+        self._transform_records = [
+            t for t in self._transform_records
+            if t.get("node_id") not in node_ids
+        ]
+
+    def serialize(self) -> Dict[str, Any]:
+        return {
+            "field_mappings": list(self._field_mappings),
+            "transform_records": [
+                {k: (v.isoformat() if isinstance(v, datetime) else v)
+                 for k, v in rec.items()}
+                for rec in self._transform_records
+            ],
+            "lineage_records": [
+                {
+                    "source_table": r.source_table,
+                    "source_column": r.source_column,
+                    "target_table": r.target_table,
+                    "target_column": r.target_column,
+                    "transform_path": r.transform_path
+                }
+                for r in self._lineage_records
+            ]
+        }
+
+    def deserialize(self, data: Dict[str, Any], pipeline_id: int, execution_id: Optional[int]):
+        self.pipeline_id = pipeline_id
+        self.execution_id = execution_id
+        self._field_mappings = list(data.get("field_mappings", []))
+        self._transform_records = []
+        for rec in data.get("transform_records", []):
+            rec = dict(rec)
+            ts = rec.get("timestamp")
+            if isinstance(ts, str):
+                try:
+                    rec["timestamp"] = datetime.fromisoformat(ts)
+                except (ValueError, TypeError):
+                    rec["timestamp"] = datetime.utcnow()
+            self._transform_records.append(rec)
+
+        self._lineage_records = []
+        self._node_record_index = {}
+        for i, r in enumerate(data.get("lineage_records", [])):
+            lr = LineageRecord(
+                pipeline_id=pipeline_id,
+                execution_id=execution_id,
+                source_table=r["source_table"],
+                source_column=r["source_column"],
+                target_table=r["target_table"],
+                target_column=r["target_column"],
+                transform_path=r.get("transform_path", []),
+                created_at=datetime.utcnow()
+            )
+            self._lineage_records.append(lr)
+
+        for i, m in enumerate(self._field_mappings):
+            nid = m.get("node_id")
+            if nid and i < len(self._lineage_records):
+                self._node_record_index.setdefault(nid, []).append(i)
+
     def save_to_db(self, db_session):
         for record in self._lineage_records:
+            record.pipeline_id = self.pipeline_id
+            record.execution_id = self.execution_id
             db_session.add(record)
         db_session.flush()
 
